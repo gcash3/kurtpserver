@@ -1,4 +1,3 @@
-//BACKEND: /socket/handlers.js
 const jwt = require('jsonwebtoken');
 const { User, Booking } = require('../models');
 
@@ -54,6 +53,9 @@ const handleSocketEvents = (io) => {
 
       // If provider, join service-specific rooms
       if (socket.user.role === 'provider' && socket.user.services) {
+        // Join provider's personal room for private notifications
+        socket.join(`provider_${socket.user._id}`);
+        
         socket.user.services.forEach(service => {
           const roomName = `service_${service.toLowerCase()}`;
           socket.join(roomName);
@@ -130,6 +132,8 @@ const handleSocketEvents = (io) => {
           });
         }
       });
+
+      // Handle provider arrival
       socket.on('provider_arrived', async (data) => {
         const { bookingId } = data;
         
@@ -161,6 +165,8 @@ const handleSocketEvents = (io) => {
           socket.emit('error', { message: error.message });
         }
       });
+
+      // Handle service completion
       socket.on('service_completed', async (data) => {
         try {
           const { bookingId } = data;
@@ -182,7 +188,8 @@ const handleSocketEvents = (io) => {
             io.to(clientSocket).emit('service_completed', {
               bookingId: booking._id.toString(),
               timestamp: data.timestamp,
-              message: 'Service has been completed by provider'
+              providerId: booking.provider.toString(),
+              message: 'Service has been completed. Please rate your experience.'
             });
           }
       
@@ -190,6 +197,81 @@ const handleSocketEvents = (io) => {
           socket.emit('error', { message: error.message });
         }
       });
+
+      // Handle rating submission
+      socket.on('submit_rating', async (data) => {
+        try {
+          const { bookingId, providerId, rating, review } = data;
+          console.log('[Socket Handler] Processing rating submission:', data);
+
+          // Validate rating
+          if (!rating || rating < 1 || rating > 5) {
+            throw new Error('Rating must be between 1 and 5');
+          }
+
+          // Verify booking status
+          const booking = await Booking.findById(bookingId);
+          if (!booking || booking.status !== 'completed') {
+            throw new Error('Invalid or incomplete booking');
+          }
+
+          // Check if user is the actual client
+          if (booking.client.toString() !== socket.user._id.toString()) {
+            throw new Error('Unauthorized to rate this booking');
+          }
+
+          // Get provider and check for existing rating
+          const provider = await User.findById(providerId);
+          if (!provider || provider.role !== 'provider') {
+            throw new Error('Provider not found');
+          }
+
+          // Check for duplicate rating
+          if (provider.ratings.some(r => r.booking.toString() === bookingId)) {
+            throw new Error('You have already rated this service');
+          }
+
+          // Add new rating
+          provider.ratings.push({
+            rating,
+            review: review || '',
+            booking: bookingId,
+            client: socket.user._id
+          });
+
+          // Calculate new average rating
+          provider.calculateAverageRating();
+          await provider.save();
+
+          console.log('[Socket Handler] Rating saved successfully');
+
+          // Notify provider of new rating
+          io.to(`provider_${providerId}`).emit('new_rating', {
+            bookingId,
+            rating,
+            review,
+            clientName: socket.user.name,
+            averageRating: provider.averageRating,
+            totalRatings: provider.totalRatings
+          });
+
+          // Confirm rating submission to client
+          socket.emit('rating_submitted', {
+            success: true,
+            bookingId,
+            providerId,
+            averageRating: provider.averageRating
+          });
+
+        } catch (error) {
+          console.error('[Socket Handler] Rating submission error:', error);
+          socket.emit('rating_error', {
+            message: error.message
+          });
+        }
+      });
+
+      // Handle booking acceptance
       socket.on('accept_booking', async (data) => {
         console.log(`Booking acceptance request - Booking ID: ${data.bookingId}`);
         
@@ -216,7 +298,9 @@ const handleSocketEvents = (io) => {
                 id: socket.user._id.toString(),
                 name: socket.user.name,
                 phone: socket.user.phone,
-                services: socket.user.services
+                services: socket.user.services,
+                averageRating: socket.user.averageRating,
+                totalRatings: socket.user.totalRatings
               },
               message: `Provider ${socket.user.name} accepted your booking`
             });
